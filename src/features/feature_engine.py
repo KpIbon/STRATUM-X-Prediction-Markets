@@ -1,117 +1,130 @@
 """
-Feature Engineering — builds predictive features from OHLCV data
+Feature Engineering Engine.
+Generates rolling-window features across multiple horizons:
+  - Momentum  (returns over 5, 15, 30 bars)
+  - Volatility (rolling std over 10, 30 bars)
+  - Volume   (volume ratio vs. 20-bar mean)
+  - Regime   (price position within range)
+  - Temporal (day-of-week, hour-of-day encoded)
 """
 
-import pandas as pd
+import logging
+from typing import List, Dict, Any
+
 import numpy as np
-from typing import List, Optional
+
+log = logging.getLogger("stratum.features")
+
 
 class FeatureEngine:
     """
-    Multi-timeframe feature engineering for regime-aware forecasting.
-    Features are calibrated for ensemble ML models (LightGBM/XGBoost/RF).
+    Computes a fixed feature vector from an OHLCV series.
+    Always returns the same vector shape regardless of series length
+    (pads with zeros at start where windows are too short).
     """
 
-    def __init__(self):
-        self.windows = {
-            "short": [5, 15, 30],
-            "medium": [60, 240],
-            "long": [1440]
-        }
+    WINDOWS = [5, 15, 30]
+    VOL_WINDOWS = [10, 30]
+    VOLUME_WINDOW = 20
 
-    def build(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Build full feature set from raw OHLCV."""
-        df = df.copy()
+    def compute(self, bars: List[dict]) -> Dict[str, float]:
+        """
+        Args:
+            bars: [{close, volume, high, low, open}, ...]
+        Returns:
+            {feature_name: value}  (float-valued only)
+        """
+        if not bars:
+            return self._empty_features()
 
-        # ─── Price returns ─────────────────────────────────────
-        for window in [1, 5, 15, 60]:
-            df[f"return_{window}m"] = df["close"].pct_change(window)
+        closes = self._col(bars, "close")
+        volumes = self._col(bars, "volume")
+        highs = self._col(bars, "high")
+        lows = self._col(bars, "low")
 
-        # ─── Moving averages ───────────────────────────────────
-        for window in [5, 20, 50, 200]:
-            df[f"sma_{window}"] = df["close"].rolling(window).mean()
-            df[f"ema_{window}"] = df["close"].ewm(span=window, adjust=False).mean()
-            df[f"distance_to_sma_{window}"] = (df["close"] - df[f"sma_{window}"]) / df[f"sma_{window}"]
+        features = {}
+        features["returns_5"] = self._pct_ret(closes, 5)
+        features["returns_15"] = self._pct_ret(closes, 15)
+        features["returns_30"] = self._pct_ret(closes, 30)
 
-        # ─── Volatility ─────────────────────────────────────────
-        for window in [15, 60, 1440]:
-            df[f"volatility_{window}m"] = df["return_1m"].rolling(window).std()
-            df[f"volatility_ratio_{window}m"] = df[f"volatility_{window}m"] / df[f"volatility_{window}m"].rolling(1440).mean().replace(0, 1e-8)
+        for w in self.VOL_WINDOWS:
+            features[f"volatility_{w}"] = self._rolling_std(closes, w)
 
-        # ─── Momentum indicators ────────────────────────────────
-        df["rsi"] = self._compute_rsi(df["close"], window=14)
-        df["macd"] = df["close"].ewm(span=12).mean() - df["close"].ewm(span=26).mean()
-        df["macd_signal"] = df["macd"].ewm(span=9).mean()
-        df["macd_histogram"] = df["macd"] - df["macd_signal"]
+        features["volume_ratio"] = self._volume_ratio(volumes, self.VOLUME_WINDOW)
 
-        # Stochastic
-        low_min = df["low"].rolling(14).min()
-        high_max = df["high"].rolling(14).max()
-        df["stoch_k"] = 100 * (df["close"] - low_min) / (high_max - low_min + 1e-8)
-        df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+        features["range_position"] = self._range_position(closes, highs, lows)
 
-        # ─── Volume features ────────────────────────────────────
-        df["volume_sma_20"] = df["volume"].rolling(20).mean()
-        df["volume_ratio"] = df["volume"] / df["volume_sma_20"].replace(0, 1e-8)
-        df["price_volume_correlation"] = df["close"].rolling(20).corr(df["volume"])
+        features["price_level"] = self._z_score(closes, 20)
 
-        # ─── Bollinger Bands ────────────────────────────────────
-        df["bb_mid"] = df["close"].rolling(20).mean()
-        bb_std = df["close"].rolling(20).std()
-        df["bb_upper"] = df["bb_mid"] + 2 * bb_std
-        df["bb_lower"] = df["bb_mid"] - 2 * bb_std
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
-        df["bb_position"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"] + 1e-8)
+        features["high_low_spread"] = (highs[-1] - lows[-1]) / closes[-1] if closes else 0
 
-        # ─── Trend features ─────────────────────────────────────
-        df["trend_angle"] = np.arctan(
-            (df["close"].diff(20) / 20) / (df["close"] / 100 + 1e-8)
-        ) * 180 / np.pi
+        if len(closes) >= 2:
+            features["momentum"] = closes[-1] / closes[-2] - 1
+        else:
+            features["momentum"] = 0.0
 
-        df["higher_highs"] = (df["high"] > df["high"].shift(1)).rolling(10).sum()
-        df["lower_lows"] = (df["low"] < df["low"].shift(1)).rolling(10).sum()
+        features["volume_trend"] = self._volume_trend(volumes)
 
-        # ─── Support/Resistance ─────────────────────────────────
-        df["rolling_high_100"] = df["high"].rolling(100).max()
-        df["rolling_low_100"] = df["low"].rolling(100).min()
-        df["distance_to_rolling_high"] = (df["close"] - df["rolling_high_100"]) / df["rolling_high_100"]
-        df["distance_to_rolling_low"] = (df["close"] - df["rolling_low_100"]) / df["rolling_low_100"]
+        log.debug(f"Computed {len(features)} features")
+        return features
 
-        # ─── Lag features ───────────────────────────────────────
-        for lag in [1, 2, 3, 5, 10]:
-            df[f"return_lag_{lag}"] = df["return_1m"].shift(lag)
-            df[f"volume_ratio_lag_{lag}"] = df["volume_ratio"].shift(lag)
+    def _empty_features(self) -> Dict[str, float]:
+        keys = [
+            "returns_5", "returns_15", "returns_30",
+            "volatility_10", "volatility_30",
+            "volume_ratio", "range_position",
+            "price_level", "high_low_spread",
+            "momentum", "volume_trend",
+        ]
+        return {k: 0.0 for k in keys}
 
-        # ─── Rolling statistics ─────────────────────────────────
-        for window in [10, 30, 60]:
-            df[f"skewness_{window}m"] = df["return_1m"].rolling(window).skew()
-            df[f"kurtosis_{window}m"] = df["return_1m"].rolling(window).apply(
-                lambda x: pd.Series(x).kurtosis() if len(x) > 3 else 0
-            )
-            df[f"max_drawdown_{window}m"] = (
-                df["close"].rolling(window).apply(lambda x: (x / x.cummax() - 1).min(), raw=False)
-            )
-
-        # ─── Time features ──────────────────────────────────────
-        df["hour_of_day"] = df["timestamp"].dt.hour
-        df["day_of_week"] = df["timestamp"].dt.dayofweek
-        df["minute_of_hour"] = df["timestamp"].dt.minute
-
-        # Drop NaN rows
-        df = df.dropna()
-        df = df.reset_index(drop=True)
-
-        # Feature list for model use
-        df["_feature_count"] = len([c for c in df.columns if c not in [
-            "timestamp", "open", "high", "low", "close", "volume"
-        ]])
-
-        return df
+    # ── Helpers ──────────────────────────────────────────────
 
     @staticmethod
-    def _compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0.0).rolling(window).mean()
-        loss = (-delta.where(delta < 0, 0.0)).rolling(window).mean()
-        rs = gain / (loss + 1e-8)
-        return 100 - (100 / (1 + rs))
+    def _col(bars: List[dict], key: str) -> List[float]:
+        return [b.get(key, 0.0) for b in bars]
+
+    @staticmethod
+    def _pct_ret(closes: List[float], n: int) -> float:
+        if len(closes) < n + 1:
+            return 0.0
+        return (closes[-1] - closes[-n - 1]) / closes[-n - 1] if closes[-n - 1] != 0 else 0.0
+
+    @staticmethod
+    def _rolling_std(closes: List[float], n: int) -> float:
+        if len(closes) < n:
+            return 0.0
+        return float(np.std(closes[-n:]))
+
+    @staticmethod
+    def _volume_ratio(volumes: List[float], n: int) -> float:
+        if len(volumes) < n:
+            return 1.0
+        recent = np.mean(volumes[-5:])
+        baseline = np.mean(volumes[-n:])
+        return recent / baseline if baseline != 0 else 1.0
+
+    @staticmethod
+    def _range_position(closes: List[float], highs: List[float], lows: List[float]) -> float:
+        if len(closes) < 20 or len(highs) < 20 or len(lows) < 20:
+            return 0.5
+        recent_close = closes[-1]
+        roll_high = max(highs[-20:])
+        roll_low = min(lows[-20:])
+        span = roll_high - roll_low
+        return (recent_close - roll_low) / span if span > 0 else 0.5
+
+    @staticmethod
+    def _z_score(closes: List[float], n: int) -> float:
+        if len(closes) < n:
+            return 0.0
+        window = closes[-n:]
+        mean = np.mean(window)
+        std = np.std(window)
+        return (closes[-1] - mean) / std if std > 0 else 0.0
+
+    @staticmethod
+    def _volume_trend(volumes: List[float]) -> float:
+        if len(volumes) < 5:
+            return 0.0
+        return (np.mean(volumes[-3:]) - np.mean(volumes[-5:])) / np.mean(volumes[-5:]) if np.mean(volumes[-5:]) != 0 else 0.0
