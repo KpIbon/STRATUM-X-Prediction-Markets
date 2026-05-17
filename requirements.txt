@@ -1,0 +1,16 @@
+# Core ML
+lightgbm>=4.0.0
+prophet>=1.1.0
+statsmodels>=0.14.0
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.26.0
+
+# Web
+requests>=2.31.0
+
+# Logging
+python-json-logger>=2.0.0
